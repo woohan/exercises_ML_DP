@@ -1,4 +1,4 @@
-# test the usage of torch dp (opacus) according to NDSS paper.
+# test the architecture of model.parameters(), and explore how to calculate the L2 norm of model differences: ∥ △¯w k∥ 2
 import os
 import torch
 from torch import nn
@@ -17,6 +17,7 @@ from sklearn.metrics import confusion_matrix, classification_report, roc_auc_sco
 from torch.utils.data import Dataset, DataLoader
 from opacus import PrivacyEngine
 import opacus
+import copy
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -27,17 +28,11 @@ class FintrustML(nn.Module):  # -wh general machine learning model for FinTrust
         self.__name__ = "finmodel"
 
         self.finmodel = nn.Sequential( # note the name is finmodel
-            nn.Linear(dims, 32),
+            nn.Linear(dims, 4),
             nn.ReLU(),
-            nn.Linear(32, 64),
+            nn.Linear(4, 8),
             nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, outdims),
+            nn.Linear(8, outdims),
             nn.Sigmoid()
         )
 
@@ -62,9 +57,9 @@ class FLDataset(Dataset): # inherited from the parent abstract class Dataset
 softmax = torch.nn.Softmax(dim=1)
 # exp parameters
 batch_size = 64
-rounds = 3
+rounds = 1
 ############################ Differential Privacy ####################################
-Diff_Privacy = True # !enable or disable DP
+Diff_Privacy = False # !enable or disable DP
 EPSILON = 1.0 # !privacy budget
 
 DELTA = 1e-5 # The target δ of the (ϵ,δ)-differential privacy guarantee. Generally, it should be set to be less than the inverse of the size of the training dataset. 
@@ -161,13 +156,17 @@ for i in range(rounds):
     print("-----------start training round {}------------".format(i+1))
     finmodel.train()
     total_train_loss = []
-    # for observing the architecture of neural network
+    #! for observing the architecture of neural network
     for name, param in finmodel.named_parameters():
         print(name, param.data)
     print('length of finmodel.parameters() list', len(list(finmodel.parameters())))
-    for i in range(len(list(finmodel.parameters()))):
-        print(f'size of {i}-th item:', list(finmodel.parameters())[i].size())
-        print(list(finmodel.parameters())[i])
+    oldmodel = copy.deepcopy(finmodel)
+    print('\n old model: ')
+    for i in range(len(list(oldmodel.parameters()))):
+        print(f'size of {i}-th item:', list(oldmodel.parameters())[i].size())
+        print(list(oldmodel.parameters())[i])
+
+    ########################################
     for j, (features, targets) in enumerate(train_loader):
         optimizer.zero_grad()
         features = features.to(device)
@@ -181,7 +180,52 @@ for i in range(rounds):
         total_train_loss.append(loss.item())
     avg_train_loss = np.average(total_train_loss)
     total_train_step += 1
+    #! for observing the architecture of neural network
+    print('\n model differences: ')
+    diff_values = []
+    norm_values = []
+    for i in range(len(list(finmodel.parameters()))):
+        model_diff = list(finmodel.parameters())[i]-list(oldmodel.parameters())[i]
+        print(model_diff)
+        diff_values.append(model_diff)
+        print(torch.norm(model_diff).item())
+        norm_values.append(torch.norm(model_diff).item())
+    # the codes below modifies finmodel updates manually by the following steps:
+    # 1. calculate the difference between finmodel and the old model (update);
+    # 2. modify the update (update/2 for instance);
+    # 3. apply the new update to finmodel
+    print('\n finmodel before manually update: \n')
+    for i in range(len(list(finmodel.parameters()))):
+        print(f'size of {i}-th item:', list(finmodel.parameters())[i].size())
+        print(list(finmodel.parameters())[i])
+    
+    print('\n check parameters.data')
+    new_params = []
+    for idx, (old_param, new_param) in enumerate(zip(oldmodel.parameters(), finmodel.parameters())):
+        print('old_param:\n', old_param)
+        model_update = new_param.data - old_param.data
+        model_update = model_update/2
+        new_param = old_param.data + model_update
+        print('model update: \n', model_update)
+        print('new_param:\n', new_param)
+        new_params.append(new_param)
 
+    for idx, (name, param) in enumerate(finmodel.state_dict().items()):
+        # Transform the parameter as required.
+        transformed_param = new_params[idx]
+        # Update the parameter.
+        param.copy_(transformed_param)
+
+    print('\n finmodel after manually update: \n')
+    for i in range(len(list(finmodel.parameters()))):
+        print(f'size of {i}-th item:', list(finmodel.parameters())[i].size())
+        print(list(finmodel.parameters())[i])
+    
+    print('norm values: ', norm_values, type(norm_values))
+    print('final norm using numpy: ', np.linalg.norm(norm_values)) # using numpy's l2 norm
+    norm_values = torch.Tensor(norm_values)
+    print('final norm using Torch: ', torch.norm(norm_values)) # using torch's l2 norm
+    ################################################################
     # get epsilon if Differential Privacy is enabled
     if Diff_Privacy == True:
         epsilon = privacy_engine.get_epsilon(DELTA)
